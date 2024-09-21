@@ -1,46 +1,65 @@
-from os.path import basename, splitext
-import os
 import cv2
-import argparse
-from detector import create_detector
+import torch
 
+class ImageBlur:
+    MIN_MODEL_CONF = 0.6  # Minimum detection confidence
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Blur carplates in images")
-    parser.add_argument('image_path', type=str, help='Path to the input image')
-    return parser.parse_args()
+    def __init__(self, model_path: str = './model/best.pt') -> None:
+        self.__model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path, force_reload=False)
+        self.__model.conf = 0.25  # NMS confidence threshold
+        self.__model.iou = 0.45  # NMS IoU threshold
+        self.__model.agnostic = False  # NMS class-agnostic
+        self.__model.multi_label = False  # NMS multiple labels per box
+        self.__model.max_det = 20  # Maximum number of detections per image
 
+    def blurLicencePlate(self, srcPath: str, dstPath: str) -> int:
+        image = cv2.imread(srcPath)
+        if image is None:
+            raise FileNotFoundError(f"Image not found or cannot be loaded: {srcPath}")
 
-def main():
-    args = parse_args()
-    image_path = args.image_path
-    directory_path = os.path.dirname(image_path)
-    
-    try:
-        image = cv2.imread(image_path)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    except:
-        print("\n< ERROR: Unable to read image file. >")
-        return
+        height, width = image.shape[:2]
 
-    # Create and destroy HarCascade XML file
-    harcascade = create_detector()
-    plate_detector = cv2.CascadeClassifier(harcascade)
-    os.remove(harcascade)
+        results = self.__model(srcPath)
+        predictions = results.pred[0]
 
-    min_area = 500
-    plates = plate_detector.detectMultiScale(gray, 1.1, 4)
-    for (x, y, w, h) in plates:
-        area = w * h
-        if area > min_area:
-            plate_img = image[y:y + h, x:x + w]
-            blurred_plate = cv2.GaussianBlur(plate_img, (31, 31), 50)
-            image[y:y + h, x:x + w] = blurred_plate
+        if predictions.shape[0] == 0:
+            print("No license plates detected.")
+            cv2.imwrite(dstPath, image)
+            return 0
 
-    save_path = os.path.join(directory_path, f'{splitext(basename(image_path))[0]}_blurred.jpg')
-    cv2.imwrite(save_path, image)
-    return
+        scores = predictions[:, 4]
+        boxes = predictions[:, :4]  # x1, y1, x2, y2
 
+        plates_blurred = 0
 
-if __name__ == '__main__':
-    main()
+        for i in range(len(boxes)):
+            # Skip low-confidence detections
+            if scores[i] < ImageBlur.MIN_MODEL_CONF:
+                continue
+
+            x1, y1, x2, y2 = [int(e) for e in boxes[i]]
+            
+            # Ensure coordinates are within image bounds
+            x1 = max(0, min(x1, width - 1))
+            y1 = max(0, min(y1, height - 1))
+            x2 = max(0, min(x2, width - 1))
+            y2 = max(0, min(y2, height - 1))
+
+            # Check if box has valid area
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            plate = image[y1:y2, x1:x2]
+
+            # Dynamically calculate blur kernel size based on plate size (optional)
+            blur_width = max(15, (x2 - x1) // 3 | 1)  # Ensure odd number
+            blur_height = max(15, (y2 - y1) // 3 | 1)
+            blurred_plate = cv2.blur(plate, (blur_width, blur_height))
+
+            # Replace the plate area with blurred version
+            image[y1:y2, x1:x2] = blurred_plate
+            plates_blurred += 1
+
+        cv2.imwrite(dstPath, image)
+        print(f"Blurred {plates_blurred} license plates.")
+        return plates_blurred
